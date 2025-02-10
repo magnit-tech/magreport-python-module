@@ -1,30 +1,29 @@
 import fastavro
+import random
 
-# Определим схему Avro
+# Определяем схему Avro для тестовых данных
 schema = {
     "type": "record",
-    "name": "Example",
+    "name": "TestData",
     "fields": [
         {"name": "column1", "type": "int"},
         {"name": "column2", "type": "int"}
     ]
 }
 
-# Создаем данные для записи
-records = [
-    {"column1": 1, "column2": 2},
-    {"column1": 3, "column2": 4},
-    {"column1": 5, "column2": 6}
-]
+# Создаем 10 тестовых записей с случайными значениями от 1 до 10
+records = []
+for i in range(10):
+    record = {
+        "column1": random.randint(1, 10),
+        "column2": random.randint(1, 10)
+    }
+    records.append(record)
 
-# Записываем данные в Avro файл
 filename = "example.avro"
-with open(filename, 'wb') as out:
+with open(filename, "wb") as out:
     fastavro.writer(out, schema, records)
 
-print(f"Avro файл '{filename}' создан с записями.")
-
-# Читаем и выводим содержимое Avro файла
-with open(filename, 'rb') as f:
-    for record in fastavro.reader(f):
-        print(record)
+print(f"Avro файл '{filename}' создан с записями:")
+for record in records:
+    print(record)
