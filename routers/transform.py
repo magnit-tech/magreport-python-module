@@ -1,72 +1,15 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Dict
-import uvicorn
-import traceback
+# routers/transform.py
+from fastapi import APIRouter
+from ..app_models import TransformRequest, TransformResponse
 import fastavro
-from master_git_vers.routers import builtins
+import traceback
+from .. import app_config
 
 
-# Функция загрузки разрешённых функций из файла настроек
-def load_allowed_builtins(file_path: str = "allowed_builtings.txt"):
-    """
-    Читает файл с именами разрешённых встроенных функций/типов и формирует словарь для безопасного eval.
-    Каждая строка файла должна содержать имя встроенной функции или типа.
-    """
-    allowed = {}
-    try:
-        with open(file_path, "r") as f:
-            for line in f:
-                name = line.strip()
-                if name:  # пропускаем пустые строки
-                    if name in builtins.__dict__:
-                        allowed[name] = builtins.__dict__[name]
-                    else:
-                        print(f"Встроенная функция или тип '{name}' не найден.")
-        return {"__builtins__": allowed}
-    except Exception as e:
-        raise Exception(f"Ошибка при чтении файла разрешённых функций: {e}")
+router = APIRouter()
 
-# Изначально загружаем SAFE_GLOBALS
-SAFE_GLOBALS = load_allowed_builtins()
 
-# Создаем приложение FastAPI
-app = FastAPI()
-
-# Модель для описания вычисляемого столбца
-class CalcColumn(BaseModel):
-    columnName: str
-    columnFormula: str
-
-# Модель для входного запроса
-class TransformRequest(BaseModel):
-    inputFileName: str
-    outputFileName: str
-    calcColumns: List[CalcColumn]
-
-# Модель для ответа
-class TransformResponse(BaseModel):
-    outputFileName: str
-    errorCode: int
-    errorMessage: str
-    calcErrors: Dict[str, str]  # Для каждого вычисляемого столбца: сообщение об ошибке или "Все было успешно"
-
-@app.get("/reload-builtins", summary="Перезагрузка разрешённых функций")
-def reload_builtins():
-    """
-    Эндпоинт для перечитывания файла настроек и обновления SAFE_GLOBALS.
-    """
-    global SAFE_GLOBALS
-    try:
-        SAFE_GLOBALS = load_allowed_builtins()
-        return {
-            "message": "Разрешённые функции успешно перезагружены.",
-            "allowed": list(SAFE_GLOBALS["__builtins__"].keys())
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post(
+@router.post(
     "/transform",
     summary="Преобразование данных из Avro-файла с расчетом новых столбцов",
     description="Принимает имя входного файла, выходного файла и массив вычисляемых столбцов с формулами. "
@@ -140,8 +83,8 @@ def transform(request: TransformRequest):
         for record in data:
             for columnName, code in compiled_columns:
                 try:
-                    # Используем SAFE_GLOBALS как globals и передаем данные записи в locals под именем 'col'
-                    result = eval(code, SAFE_GLOBALS, {"col": record})
+                    # Используем config.SAFE_GLOBALS как globals и передаем данные записи в locals под именем 'col'
+                    result = eval(code, app_config.SAFE_GLOBALS, {"col": record})
                     if isinstance(result, (int, float, str)):
                         record[columnName] = result
                     else:
@@ -177,7 +120,3 @@ def transform(request: TransformRequest):
             errorMessage=error_message,
             calcErrors={}
         )
-
-# Запуск сервера, если файл запускается напрямую
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
