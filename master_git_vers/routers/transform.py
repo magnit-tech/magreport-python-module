@@ -1,188 +1,174 @@
-# routers/transform.py
 from fastapi import APIRouter
 from ..app_models import TransformRequest, TransformResponse
 import fastavro
 import traceback
 from .. import app_config
-from enum import Enum
 import time
 
 router = APIRouter()
 
+# --- Оптимизированные функции для определения и агрегации приоритетов ---
 
-# Функции для определения и агрегации типов
+_INT, _DOUBLE, _STRING = 1, 2, 3
 
-def determine_type(value):
+def determine_priority(value):
     """
-    Определяет тип переданного значения.
-    Если value равно None, возвращает None.
-    Если значение имеет тип int, возвращает "int".
-    Если значение имеет тип float, возвращает "double".
-    Если значение имеет тип str, возвращает "string".
-    В остальных случаях возвращает "string".
+    Определяет приоритет переданного значения:
+    целые -> INT, float -> DOUBLE, прочие (включая None) -> STRING
     """
-    if value is None:
-        return None
-    elif isinstance(value, int): #do enum
-        return "int"
-    elif isinstance(value, float):#do enum
-        return "double"
-    elif isinstance(value, str):#do enum
-        return "string"
-    else:
-        return "string"
+    t = type(value)
+    if t is int:
+        return _INT
+    if t is float:
+        return _DOUBLE
+    return _STRING
 
 
-class TypePriority(Enum):
-    INT = 1
-    DOUBLE = 2
-    STRING = 3
+def aggregate_priority(current, new):
+    """
+    Агрегирует два приоритета: если один None — возвращает другой,
+    иначе — максимальный.
+    """
+    if current is None:
+        return new
+    if new is None:
+        return current
+    return new if new > current else current
 
-def aggregate_type(current_type, new_type):
-    if new_type is None:
-        return current_type
-    if current_type is None:
-        return new_type
-
-    # Если оба типа одинаковые, возвращаем один из них
-    if current_type == new_type:
-        return current_type
-
-    # Преобразуем строки в соответствующие члены enum
-    current_priority = TypePriority[current_type.upper()]
-    new_priority = TypePriority[new_type.upper()]  #upper - дорогая операция, добавить в конец, работать с enum
-
-    return new_type if new_priority.value > current_priority.value else current_type
-
+# --- Конец оптимизированных функций ---
 
 @router.post(
     "/transform",
     summary="Преобразование данных из Avro-файла с расчетом новых столбцов",
-    description="Принимает имя входного файла, выходного файла и массив вычисляемых столбцов с формулами. "
-                "Вычисления выполняются последовательно: результат одного может использоваться в последующих. "
-                "Если вычисление для записи завершается ошибкой, значение становится null, а ошибки агрегируются в ответе.",
+    description=(
+        "Принимает имя входного файла, выходного файла и массив вычисляемых "
+        "столбцов с формулами. Вычисления выполняются последовательно: "
+        "результат одного может использоваться в последующих. Если вычисление "
+        "для записи завершается ошибкой, значение становится null, а ошибки "
+        "агрегируются в ответе."
+    ),
     response_model=TransformResponse,
     tags=["Data Transformation"]
 )
-
 def transform(request: TransformRequest):
     input_file = request.inputFileName
     output_file = request.outputFileName
     calc_columns = request.calcColumns
 
-    # Проверка: имена производных столбцов не должны дублироваться
-    calc_names = [calc.columnName for calc in calc_columns]
-    if len(calc_names) != len(set(calc_names)):
-        error_msg = "Имена производных столбцов не должны дублироваться между собой."
+    # 1) Проверка: уникальность имён вычисляемых столбцов
+    names = [c.columnName for c in calc_columns]
+    if len(names) != len(set(names)):
         return TransformResponse(
             outputFileName="",
             errorCode=1,
-            errorMessage=error_msg,
+            errorMessage="Имена производных столбцов не должны дублироваться между собой.",
             calcErrors={}
         )
-    # Замер времени начала обработки
+
     start_time = time.time()
-    # Предварительная компиляция формул
-    compiled_columns = []
+
+    # 2) Компиляция формул
+    compiled = []
     for col in calc_columns:
         try:
-            code = compile(source=col.columnFormula, filename='', mode='eval')
-            compiled_columns.append((col.columnName, code))
+            code = compile(col.columnFormula, filename="", mode="eval")
+            compiled.append((col.columnName, code))
         except Exception:
-            error_msg = f"Ошибка компиляции формулы для столбца '{col.columnName}':\n{traceback.format_exc()}"
             return TransformResponse(
                 outputFileName="",
                 errorCode=1,
-                errorMessage=error_msg,
+                errorMessage=(
+                    f"Ошибка компиляции формулы для столбца '{col.columnName}':\n"
+                    f"{traceback.format_exc()}"
+                ),
                 calcErrors={}
             )
 
-    # Счетчики ошибок для каждого вычисляемого столбца
-    error_counts = {col.columnName: 0 for col in calc_columns}
-    # Инициализация агрегированных типов для каждого вычисляемого столбца
-    aggregated_types = {col.columnName: None for col in calc_columns}
+    # 3) Инициализация счётчиков
+    error_counts = {c.columnName: 0 for c in calc_columns}
+    priorities   = {c.columnName: None for c in calc_columns}
+    _det = determine_priority
+    _agg = aggregate_priority
+
+    # 4) Локальные ссылки и подготовка для eval
+    sg = app_config.SAFE_GLOBALS
+    loc = {}
+    writer = fastavro.writer
+    AVRO_MAP = {
+        _INT:    ("int",    "INT"),
+        _DOUBLE: ("float",  "DOUBLE"),
+        _STRING: ("string", "STRING"),
+    }
 
     try:
-        # Чтение входного Avro-файла
-        with open(input_file, "rb") as infile:
-            reader = fastavro.reader(infile)
-            data = [record for record in reader]
+        # 5) Чтение Avro
+        with open(input_file, "rb") as f:
+            reader = fastavro.reader(f)
+            data   = [r for r in reader]
             schema = reader.schema
 
-
-
-        # Проверка: вычисляемые столбцы не должны дублировать исходные имена столбцов
-        original_column_names = [field["name"] for field in schema["fields"]]
-        for calc in calc_columns:
-            if calc.columnName in original_column_names:
-                error_msg = f"Имя вычисляемого столбца '{calc.columnName}' дублирует имя исходного столбца."
+        # 6) Проверка дублирования имён
+        existing = {fld["name"] for fld in schema["fields"]}
+        for col in calc_columns:
+            if col.columnName in existing:
                 return TransformResponse(
                     outputFileName="",
                     errorCode=1,
-                    errorMessage=error_msg,
+                    errorMessage=(
+                        f"Имя вычисляемого столбца '{col.columnName}' "
+                        "дублирует имя исходного столбца."
+                    ),
                     calcErrors={}
                 )
 
-        # Выполняем вычисления для каждой записи
-        for record in data:
-            for columnName, code in compiled_columns:
+        # 7) Основной цикл вычислений
+        for rec in data:
+            loc['col'] = rec
+            for name, code in compiled:
                 try:
-                    # Используем app_config.SAFE_GLOBALS как globals и передаем данные записи в locals под именем 'col'
-                    result = eval(code, app_config.SAFE_GLOBALS, {"col": record})
-                    # Обновляем агрегированный тип для данного столбца
-                    current_value_type = determine_type(result)
-                    aggregated_types[columnName] = aggregate_type(aggregated_types[columnName], current_value_type)
-
-                    if isinstance(result, (int, float, str)):
-                        record[columnName] = result
-                    else:
-                        record[columnName] = str(result)
+                    res = eval(code, sg, loc)
+                    pr  = _det(res)
+                    priorities[name] = _agg(priorities[name], pr)
+                    rec[name] = res if isinstance(res, (int, float, str)) else str(res)
                 except Exception:
-                    record[columnName] = None
-                    error_counts[columnName] += 1
+                    rec[name] = None
+                    error_counts[name] += 1
 
-        # Добавляем вычисляемые столбцы в схему с агрегированным типом
-        type_mapping = {"int": "int", "double": "float", "string": "string"}
-        for calc in calc_columns:
-            final_type = aggregated_types[calc.columnName] if aggregated_types[
-                                                                  calc.columnName] is not None else "string"
-            # Приводим полученный тип к верхнему регистру, чтобы получить INT, DOUBLE или STRING
-            data_type_value = final_type.upper()
-
+        # 8) Обновление схемы и запись
+        for col in calc_columns:
+            p = priorities[col.columnName] or _STRING
+            avro_type, data_type = AVRO_MAP[p]
             schema["fields"].append({
-                "name": calc.columnName,
-                "type": ["null", type_mapping.get(final_type, "string")],
+                "name":    col.columnName,
+                "type":    ["null", avro_type],
                 "default": None,
-                "dataType": data_type_value  # Новое поле в схеме
+                "dataType": data_type,
             })
 
-        # Записываем результат в выходной Avro-файл
-        with open(output_file, "wb") as outfile:
-            fastavro.writer(outfile, schema, data, codec='snappy')
-        # Замер времени окончания обработки
-        end_time = time.time()
-        elapsed_time = end_time - start_time
+        with open(output_file, "wb") as f:
+            writer(f, schema, data, codec="snappy")
 
-        # Формируем информацию об ошибках для каждого столбца
-        calc_errors = {}
-        for calc in calc_columns:
-            if error_counts[calc.columnName] > 0:
-                calc_errors[calc.columnName] = f"Ошибка вычисления в {error_counts[calc.columnName]} экземплярах ячейки"
-            else:
-                calc_errors[calc.columnName] = "Все было успешно"
-        print(f"Общее время обработки: {elapsed_time:.3f} сек")
+        # 9) Отчёт и возврат ответа
+        elapsed = time.time() - start_time
+        calc_errors = {
+            col.columnName: (
+                f"Ошибка вычисления в {error_counts[col.columnName]} экземплярах"
+                if error_counts[col.columnName] else "Все было успешно"
+            )
+            for col in calc_columns
+        }
+
         return TransformResponse(
             outputFileName=output_file,
             errorCode=0,
-            errorMessage=f"Общее время обработки: {elapsed_time:.3f} сек",
+            errorMessage=f"Общее время обработки: {elapsed:.3f} сек",
             calcErrors=calc_errors
         )
 
     except Exception:
-        error_message = traceback.format_exc()
         return TransformResponse(
             outputFileName="",
             errorCode=1,
-            errorMessage=error_message,
+            errorMessage=traceback.format_exc(),
             calcErrors={}
         )

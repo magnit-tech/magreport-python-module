@@ -1,5 +1,10 @@
 # IDEA
 .idea/*
 
+
+testtenmillion.avro
+
+outputtenmiilion.avro
+
 # Python binaries
 __pycache__/*

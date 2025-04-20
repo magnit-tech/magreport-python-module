@@ -13,14 +13,14 @@ schema = {
 
 # Создаем 10 тестовых записей с случайными значениями от 1 до 10
 records = []
-for i in range(1000000):
+for i in range(10000000):
     record = {
         "column1": random.randint(1, 100),
         "column2": random.randint(1, 100)
     }
     records.append(record)
 
-filename = "testmillion.avro"
+filename = "testtenmillion.avro"
 with open(filename, "wb") as out:
     fastavro.writer(out, schema, records)
 
