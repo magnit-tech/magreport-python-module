@@ -1,5 +1,8 @@
 # IDEA
 .idea/*
 
+
+*.avro
+
 # Python binaries
 __pycache__/*
